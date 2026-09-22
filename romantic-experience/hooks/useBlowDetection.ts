@@ -9,59 +9,32 @@ export type MicPermissionState = "idle" | "listening" | "denied" | "unsupported"
  * Fine-tune these values to adjust microphone detection behavior.
  */
 export const DEFAULT_BLOW_CONFIG = {
-  /** FFT size for Web Audio AnalyserNode. 2048 provides ~21.5 Hz bin resolution at 44.1 kHz */
-  FFT_SIZE: 2048,
+  /** FFT size for Web Audio AnalyserNode from sherryuser/cake-blow */
+  FFT_SIZE: 256,
 
-  /** Lower bound of wind/rumble frequency band in Hz */
-  LOW_FREQ_MIN_HZ: 20,
+  /** Average byte frequency threshold from sherryuser/cake-blow (average > 40) */
+  FREQUENCY_AVERAGE_THRESHOLD: 40,
 
-  /** Upper bound of wind/rumble frequency band in Hz (expanded to 1200 Hz for real-world turbulent air) */
-  LOW_FREQ_MAX_HZ: 1200,
-
-  /** Required minimum percentage of total spectral energy in wind band (0.35 = 35%) */
-  LOW_FREQ_RATIO_THRESHOLD: 0.35,
-
-  /** Base RMS threshold required to trigger blow detection */
-  BLOW_RMS_THRESHOLD: 0.018,
-
-  /** Duration (ms) to sample ambient room noise on microphone activation */
-  CALIBRATION_DURATION_MS: 400,
-
-  /** Multiplier for dynamic ambient noise floor adjustment */
-  NOISE_FLOOR_MULTIPLIER: 1.8,
-
-  /** Safety margin added above the ambient noise floor */
-  NOISE_FLOOR_MARGIN: 0.01,
-
-  /** Continuous duration (ms) blowing condition must be active to filter short impulses */
-  SUSTAINED_DURATION_MS: 150,
-
-  /** AnalyserNode smoothing time constant */
-  SMOOTHING_TIME_CONSTANT: 0.2,
+  /** Detection polling interval in milliseconds from sherryuser/cake-blow (setInterval 200ms) */
+  POLLING_INTERVAL_MS: 200,
 };
 
 export interface BlowDetectionConfig {
   fftSize?: number;
-  lowFreqMinHz?: number;
-  lowFreqMaxHz?: number;
-  lowFreqRatioThreshold?: number;
-  baseRmsThreshold?: number;
-  calibrationDurationMs?: number;
-  noiseFloorMultiplier?: number;
-  noiseFloorMargin?: number;
-  sustainedDurationMs?: number;
-  smoothingTimeConstant?: number;
+  frequencyAverageThreshold?: number;
+  pollingIntervalMs?: number;
 }
 
 interface UseBlowDetectionProps {
   onBlowDetected: () => void;
   enabled: boolean;
   config?: BlowDetectionConfig;
-  /** Deprecated legacy threshold props preserved for backwards compatibility */
-  energyThreshold?: number;
-  windThreshold?: number;
 }
 
+/**
+ * Blow detection hook ported from reference repository:
+ * https://github.com/sherryuser/cake-blow
+ */
 export function useBlowDetection({
   onBlowDetected,
   enabled,
@@ -72,8 +45,8 @@ export function useBlowDetection({
   const audioCtxRef = useRef<AudioContext | null>(null);
   const sourceNodeRef = useRef<MediaStreamAudioSourceNode | null>(null);
   const analyserNodeRef = useRef<AnalyserNode | null>(null);
-  const animFrameIdRef = useRef<number | null>(null);
-  const hasTriggeredRef = useRef<boolean>(false);
+  const intervalIdRef = useRef<NodeJS.Timeout | null>(null);
+  const hasTriggeredStateRef = useRef<boolean>(false);
   const onBlowDetectedRef = useRef(onBlowDetected);
 
   useEffect(() => {
@@ -82,26 +55,15 @@ export function useBlowDetection({
 
   // Merge default config with user-provided config overrides
   const fftSize = userConfig?.fftSize ?? DEFAULT_BLOW_CONFIG.FFT_SIZE;
-  const lowFreqMinHz = userConfig?.lowFreqMinHz ?? DEFAULT_BLOW_CONFIG.LOW_FREQ_MIN_HZ;
-  const lowFreqMaxHz = userConfig?.lowFreqMaxHz ?? DEFAULT_BLOW_CONFIG.LOW_FREQ_MAX_HZ;
-  const lowFreqRatioThreshold =
-    userConfig?.lowFreqRatioThreshold ?? DEFAULT_BLOW_CONFIG.LOW_FREQ_RATIO_THRESHOLD;
-  const baseRmsThreshold = userConfig?.baseRmsThreshold ?? DEFAULT_BLOW_CONFIG.BLOW_RMS_THRESHOLD;
-  const calibrationDurationMs =
-    userConfig?.calibrationDurationMs ?? DEFAULT_BLOW_CONFIG.CALIBRATION_DURATION_MS;
-  const noiseFloorMultiplier =
-    userConfig?.noiseFloorMultiplier ?? DEFAULT_BLOW_CONFIG.NOISE_FLOOR_MULTIPLIER;
-  const noiseFloorMargin =
-    userConfig?.noiseFloorMargin ?? DEFAULT_BLOW_CONFIG.NOISE_FLOOR_MARGIN;
-  const sustainedDurationMs =
-    userConfig?.sustainedDurationMs ?? DEFAULT_BLOW_CONFIG.SUSTAINED_DURATION_MS;
-  const smoothingTimeConstant =
-    userConfig?.smoothingTimeConstant ?? DEFAULT_BLOW_CONFIG.SMOOTHING_TIME_CONSTANT;
+  const threshold =
+    userConfig?.frequencyAverageThreshold ?? DEFAULT_BLOW_CONFIG.FREQUENCY_AVERAGE_THRESHOLD;
+  const pollingIntervalMs =
+    userConfig?.pollingIntervalMs ?? DEFAULT_BLOW_CONFIG.POLLING_INTERVAL_MS;
 
   const stopMic = useCallback(() => {
-    if (animFrameIdRef.current) {
-      cancelAnimationFrame(animFrameIdRef.current);
-      animFrameIdRef.current = null;
+    if (intervalIdRef.current) {
+      clearInterval(intervalIdRef.current);
+      intervalIdRef.current = null;
     }
     if (sourceNodeRef.current) {
       try {
@@ -129,14 +91,14 @@ export function useBlowDetection({
   }, []);
 
   const enableMic = useCallback(async () => {
-    if (hasTriggeredRef.current || !enabled) return;
+    if (hasTriggeredStateRef.current || !enabled) return;
     if (typeof window === "undefined" || !navigator.mediaDevices?.getUserMedia) {
       setMicState("unsupported");
       return;
     }
 
     try {
-      // 1. Initialize or resume AudioContext
+      // 1. Initialize AudioContext (window.AudioContext || window.webkitAudioContext)
       if (!audioCtxRef.current || audioCtxRef.current.state === "closed") {
         const AudioCtxClass =
           window.AudioContext ||
@@ -153,147 +115,58 @@ export function useBlowDetection({
         return;
       }
 
-      // 2. Request audio stream with broad cross-browser compatibility
-      let stream: MediaStream;
-      try {
-        stream = await navigator.mediaDevices.getUserMedia({
-          audio: {
-            echoCancellation: false,
-            noiseSuppression: false,
-            autoGainControl: true,
-          },
-        });
-      } catch {
-        stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-      }
-
+      // 2. Request microphone stream (navigator.mediaDevices.getUserMedia({ audio: true }))
+      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
       streamRef.current = stream;
+
       const audioContext = audioCtxRef.current;
       if (audioContext.state === "suspended") {
         await audioContext.resume();
       }
 
-      // 3. Connect MediaStreamSource to AnalyserNode with configured fftSize
-      const source = audioContext.createMediaStreamSource(stream);
+      // 3. Connect MediaStreamSource to AnalyserNode (analyser.fftSize = 256)
+      const microphone = audioContext.createMediaStreamSource(stream);
       const analyser = audioContext.createAnalyser();
-      analyser.fftSize = fftSize;
-      analyser.smoothingTimeConstant = smoothingTimeConstant;
-      source.connect(analyser);
+      analyser.fftSize = fftSize; // 256
+      microphone.connect(analyser);
 
-      sourceNodeRef.current = source;
+      sourceNodeRef.current = microphone;
       analyserNodeRef.current = analyser;
-
-      const timeDomainData = new Float32Array(analyser.fftSize);
-      const frequencyData = new Uint8Array(analyser.frequencyBinCount);
       setMicState("listening");
 
-      // 4. Calibration & blow detection tracking state
-      const calibrationStartTime = performance.now();
-      const ambientSamples: number[] = [];
-      let dynamicRmsThreshold = baseRmsThreshold;
-      let ambientNoiseFloor = 0;
-      let isCalibrated = false;
-      let blowStartTime: number | null = null;
+      // 4. Exact blow detection algorithm ported from sherryuser/cake-blow
+      const isBlowing = () => {
+        if (!analyserNodeRef.current) return false;
+        const currentAnalyser = analyserNodeRef.current;
+        const bufferLength = currentAnalyser.frequencyBinCount; // 128
+        const dataArray = new Uint8Array(bufferLength);
+        currentAnalyser.getByteFrequencyData(dataArray);
 
-      // 5. Real-time multi-criteria blow detection loop
-      const detectBlow = () => {
-        if (hasTriggeredRef.current || !audioCtxRef.current) return;
-
-        // A) Time-domain RMS Volume Calculation
-        analyser.getFloatTimeDomainData(timeDomainData);
-        let sumSquares = 0;
-        for (let i = 0; i < timeDomainData.length; i++) {
-          const sample = timeDomainData[i];
-          sumSquares += sample * sample;
+        let sum = 0;
+        for (let i = 0; i < bufferLength; i++) {
+          sum += dataArray[i];
         }
-        const currentRms = Math.sqrt(sumSquares / timeDomainData.length);
+        const average = sum / bufferLength;
 
-        const now = performance.now();
-
-        // B) Initial Ambient Noise Floor Calibration (~400ms baseline sampling)
-        if (!isCalibrated) {
-          ambientSamples.push(currentRms);
-          if (now - calibrationStartTime >= calibrationDurationMs) {
-            ambientNoiseFloor =
-              ambientSamples.reduce((acc, v) => acc + v, 0) / (ambientSamples.length || 1);
-            dynamicRmsThreshold = Math.max(
-              baseRmsThreshold,
-              ambientNoiseFloor * noiseFloorMultiplier + noiseFloorMargin
-            );
-            isCalibrated = true;
-          }
-        }
-
-        // C) Spectral & Frequency Analysis (Low-to-mid frequency wind 20–1200 Hz)
-        analyser.getByteFrequencyData(frequencyData);
-        const sampleRate = audioContext.sampleRate;
-        const binWidth = sampleRate / analyser.fftSize;
-
-        let lowFreqEnergy = 0;
-        let totalFreqEnergy = 0;
-
-        for (let i = 0; i < frequencyData.length; i++) {
-          const freq = i * binWidth;
-          const norm = frequencyData[i] / 255;
-          const power = norm * norm;
-          totalFreqEnergy += power;
-
-          if (freq >= lowFreqMinHz && freq <= lowFreqMaxHz) {
-            lowFreqEnergy += power;
-          }
-        }
-
-        const lowFreqRatio = totalFreqEnergy > 0.00001 ? lowFreqEnergy / totalFreqEnergy : 0;
-
-        // D) Multi-Criteria Evaluation:
-        // 1. RMS above dynamic noise floor OR relative spike (2.8x ambient noise floor)
-        // 2. Wind turbulence frequency energy ratio >= 35% OR high amplitude airflow (>0.05 RMS)
-        const isRmsElevated =
-          currentRms >= dynamicRmsThreshold ||
-          (isCalibrated && ambientNoiseFloor > 0 && currentRms >= ambientNoiseFloor * 2.8 && currentRms >= 0.012);
-
-        const isBlowingFrame =
-          isRmsElevated && (lowFreqRatio >= lowFreqRatioThreshold || currentRms >= 0.05);
-
-        // E) Sustained Blow Duration Filter (Requires 150ms continuous blow, ignoring <50ms clicks)
-        if (isBlowingFrame) {
-          if (blowStartTime === null) {
-            blowStartTime = now;
-          }
-          const elapsedDuration = now - blowStartTime;
-
-          if (elapsedDuration >= sustainedDurationMs && !hasTriggeredRef.current) {
-            hasTriggeredRef.current = true;
-            stopMic();
-            onBlowDetectedRef.current();
-            return;
-          }
-        } else {
-          blowStartTime = null;
-        }
-
-        animFrameIdRef.current = requestAnimationFrame(detectBlow);
+        return average > threshold; // > 40
       };
 
-      detectBlow();
+      // 5. Polling check every 200ms (matching setInterval(blowOutCandles, 200))
+      if (intervalIdRef.current) clearInterval(intervalIdRef.current);
+      intervalIdRef.current = setInterval(() => {
+        if (hasTriggeredStateRef.current || !audioCtxRef.current) return;
+
+        if (isBlowing() && !hasTriggeredStateRef.current) {
+          hasTriggeredStateRef.current = true;
+          stopMic();
+          onBlowDetectedRef.current();
+        }
+      }, pollingIntervalMs);
     } catch (err) {
-      console.warn("Microphone access error:", err);
+      console.log("Unable to access microphone: " + err);
       setMicState("denied");
     }
-  }, [
-    enabled,
-    fftSize,
-    lowFreqMinHz,
-    lowFreqMaxHz,
-    lowFreqRatioThreshold,
-    baseRmsThreshold,
-    calibrationDurationMs,
-    noiseFloorMultiplier,
-    noiseFloorMargin,
-    sustainedDurationMs,
-    smoothingTimeConstant,
-    stopMic,
-  ]);
+  }, [enabled, fftSize, threshold, pollingIntervalMs, stopMic]);
 
   useEffect(() => {
     if (!enabled) {
