@@ -15,26 +15,26 @@ export const DEFAULT_BLOW_CONFIG = {
   /** Lower bound of wind/rumble frequency band in Hz */
   LOW_FREQ_MIN_HZ: 20,
 
-  /** Upper bound of wind/rumble frequency band in Hz */
-  LOW_FREQ_MAX_HZ: 250,
+  /** Upper bound of wind/rumble frequency band in Hz (expanded to 1200 Hz for real-world turbulent air) */
+  LOW_FREQ_MAX_HZ: 1200,
 
-  /** Required minimum percentage of total spectral energy in 20-250 Hz band (0.65 = 65%) */
-  LOW_FREQ_RATIO_THRESHOLD: 0.65,
+  /** Required minimum percentage of total spectral energy in wind band (0.35 = 35%) */
+  LOW_FREQ_RATIO_THRESHOLD: 0.35,
 
-  /** Baseline RMS threshold required to trigger blow detection */
-  BLOW_RMS_THRESHOLD: 0.035,
+  /** Base RMS threshold required to trigger blow detection */
+  BLOW_RMS_THRESHOLD: 0.018,
 
   /** Duration (ms) to sample ambient room noise on microphone activation */
-  CALIBRATION_DURATION_MS: 500,
+  CALIBRATION_DURATION_MS: 400,
 
   /** Multiplier for dynamic ambient noise floor adjustment */
-  NOISE_FLOOR_MULTIPLIER: 1.5,
+  NOISE_FLOOR_MULTIPLIER: 1.8,
 
   /** Safety margin added above the ambient noise floor */
-  NOISE_FLOOR_MARGIN: 0.02,
+  NOISE_FLOOR_MARGIN: 0.01,
 
-  /** Continuous duration (ms) blowing condition must be active to ignore impulses <100ms */
-  SUSTAINED_DURATION_MS: 250,
+  /** Continuous duration (ms) blowing condition must be active to filter short impulses */
+  SUSTAINED_DURATION_MS: 150,
 
   /** AnalyserNode smoothing time constant */
   SMOOTHING_TIME_CONSTANT: 0.2,
@@ -153,14 +153,14 @@ export function useBlowDetection({
         return;
       }
 
-      // 2. Request audio stream without aggressive browser noise suppression
+      // 2. Request audio stream with broad cross-browser compatibility
       let stream: MediaStream;
       try {
         stream = await navigator.mediaDevices.getUserMedia({
           audio: {
             echoCancellation: false,
             noiseSuppression: false,
-            autoGainControl: false,
+            autoGainControl: true,
           },
         });
       } catch {
@@ -191,6 +191,7 @@ export function useBlowDetection({
       const calibrationStartTime = performance.now();
       const ambientSamples: number[] = [];
       let dynamicRmsThreshold = baseRmsThreshold;
+      let ambientNoiseFloor = 0;
       let isCalibrated = false;
       let blowStartTime: number | null = null;
 
@@ -209,21 +210,21 @@ export function useBlowDetection({
 
         const now = performance.now();
 
-        // B) Initial Noise Floor Calibration (~500ms baseline sampling)
+        // B) Initial Ambient Noise Floor Calibration (~400ms baseline sampling)
         if (!isCalibrated) {
           ambientSamples.push(currentRms);
           if (now - calibrationStartTime >= calibrationDurationMs) {
-            const noiseFloor =
+            ambientNoiseFloor =
               ambientSamples.reduce((acc, v) => acc + v, 0) / (ambientSamples.length || 1);
             dynamicRmsThreshold = Math.max(
               baseRmsThreshold,
-              noiseFloor * noiseFloorMultiplier + noiseFloorMargin
+              ambientNoiseFloor * noiseFloorMultiplier + noiseFloorMargin
             );
             isCalibrated = true;
           }
         }
 
-        // C) Spectral & Frequency Analysis (Low-Frequency 20–250 Hz Dominance)
+        // C) Spectral & Frequency Analysis (Low-to-mid frequency wind 20–1200 Hz)
         analyser.getByteFrequencyData(frequencyData);
         const sampleRate = audioContext.sampleRate;
         const binWidth = sampleRate / analyser.fftSize;
@@ -233,7 +234,6 @@ export function useBlowDetection({
 
         for (let i = 0; i < frequencyData.length; i++) {
           const freq = i * binWidth;
-          // Convert byte magnitude (0-255) to normalized power
           const norm = frequencyData[i] / 255;
           const power = norm * norm;
           totalFreqEnergy += power;
@@ -245,13 +245,17 @@ export function useBlowDetection({
 
         const lowFreqRatio = totalFreqEnergy > 0.00001 ? lowFreqEnergy / totalFreqEnergy : 0;
 
-        // D) Multi-Criteria Evaluation: High Volume RMS + Low-Frequency Wind Dominance
-        const isBlowingFrame =
-          isCalibrated &&
-          currentRms >= dynamicRmsThreshold &&
-          lowFreqRatio >= lowFreqRatioThreshold;
+        // D) Multi-Criteria Evaluation:
+        // 1. RMS above dynamic noise floor OR relative spike (2.8x ambient noise floor)
+        // 2. Wind turbulence frequency energy ratio >= 35% OR high amplitude airflow (>0.05 RMS)
+        const isRmsElevated =
+          currentRms >= dynamicRmsThreshold ||
+          (isCalibrated && ambientNoiseFloor > 0 && currentRms >= ambientNoiseFloor * 2.8 && currentRms >= 0.012);
 
-        // E) Sustained Blow Duration Filter (Debounce short spikes < 100ms)
+        const isBlowingFrame =
+          isRmsElevated && (lowFreqRatio >= lowFreqRatioThreshold || currentRms >= 0.05);
+
+        // E) Sustained Blow Duration Filter (Requires 150ms continuous blow, ignoring <50ms clicks)
         if (isBlowingFrame) {
           if (blowStartTime === null) {
             blowStartTime = now;
