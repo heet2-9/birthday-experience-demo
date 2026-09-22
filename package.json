@@ -1,0 +1,17 @@
+{
+  "name": "birthday-website",
+  "private": true,
+  "scripts": {
+    "dev": "npm --prefix romantic-experience run dev",
+    "build": "npm --prefix romantic-experience run build",
+    "start": "npm --prefix romantic-experience run start",
+    "lint": "npm --prefix romantic-experience run lint"
+  },
+  "dependencies": {
+    "canvas-confetti": "^1.9.4",
+    "lucide-react": "^1.24.0"
+  },
+  "devDependencies": {
+    "@types/canvas-confetti": "^1.9.0"
+  }
+}
