@@ -1,0 +1,5 @@
+{
+  "buildCommand": "npm --prefix romantic-experience run build",
+  "outputDirectory": "romantic-experience/.next",
+  "framework": "nextjs"
+}
